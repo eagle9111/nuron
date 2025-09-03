@@ -195,7 +195,7 @@ const handleShare = async () => {
         title: action === 'translate' ? `Translation (${getDeviceLanguage()})` : 'Summary',
         content: result,
       });
-    } catch (error) {
+    } catch  {
       setResultModal({
         visible: true,
         title: 'Error',

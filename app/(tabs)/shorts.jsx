@@ -16,7 +16,9 @@ import {
   View
 } from 'react-native';
 
-export async function fetchNasaShortVideos(page = 1) {
+export async function fetchNasaShortVideos(page = 1, retryCount = 0) {
+  const MAX_RETRIES = 2;
+  
   try {
     const queries = [
       "space video",
@@ -32,34 +34,53 @@ export async function fetchNasaShortVideos(page = 1) {
     ];
     
     const query = queries[Math.floor(Math.random() * queries.length)];
-    const url = `https://images-api.nasa.gov/search?q=${encodeURIComponent(
-      query
-    )}&media_type=video&page=${page}`;
+    const url = `https://images-api.nasa.gov/search?q=${encodeURIComponent(query)}&media_type=video&page=${page}`;
+
+    console.log('[NASA] Fetching videos with query:', query, 'URL:', url);
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    const timeoutId = setTimeout(() => controller.abort(), 30000); 
 
-    const response = await fetch(url, { signal: controller.signal });
+    const response = await fetch(url, { 
+      signal: controller.signal,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'NASA-Mobile-App/1.0',
+        'Cache-Control': 'no-cache'
+      }
+    });
     clearTimeout(timeoutId);
 
+    console.log('[NASA] API Response:', response.status, response.ok);
+
     if (!response.ok) {
-      return { videos: [], hasMore: false };
+      throw new Error(`NASA API Error: HTTP ${response.status}`);
     }
 
     const data = await response.json();
-    if (!data?.collection?.items) return { videos: [], hasMore: false };
+    console.log('[NASA] API Data:', { 
+      hasCollection: !!data?.collection, 
+      itemsCount: data?.collection?.items?.length || 0 
+    });
+
+    if (!data?.collection?.items || data.collection.items.length === 0) {
+      console.warn('[NASA] No items in API response');
+      return { videos: [], hasMore: false };
+    }
 
     const allItems = data.collection.items.slice(0, 50); 
-    const sortedItems = allItems
-      .sort((a, b) => {
-        const dateA = a.data?.[0]?.date_created ? new Date(a.data[0].date_created) : new Date('2000-01-01');
-        const dateB = b.data?.[0]?.date_created ? new Date(b.data[0].date_created) : new Date('2000-01-01');
-        return dateB - dateA;
-      });
+    const sortedItems = allItems.sort((a, b) => {
+      const dateA = a.data?.[0]?.date_created ? new Date(a.data[0].date_created) : new Date('2000-01-01');
+      const dateB = b.data?.[0]?.date_created ? new Date(b.data[0].date_created) : new Date('2000-01-01');
+      return dateB - dateA;
+    });
 
-    const assetPromises = sortedItems.map(async (item) => {
+    const validVideos = [];
+    
+    for (let i = 0; i < Math.min(sortedItems.length, 12); i++) {
+      const item = sortedItems[i];
       const firstData = item.data?.[0];
-      if (!firstData?.nasa_id) return null;
+      if (!firstData?.nasa_id) continue;
 
       const description = firstData.description?.toLowerCase() || '';
       const title = firstData.title?.toLowerCase() || '';
@@ -74,37 +95,53 @@ export async function fetchNasaShortVideos(page = 1) {
                            title.includes('complete coverage') ||
                            title.includes('full length');
       
-      if (isLongContent) {
-        return null;
-      }
+      if (isLongContent) continue;
 
       try {
         const assetController = new AbortController();
         const assetTimeoutId = setTimeout(() => assetController.abort(), 10000);
         
         const assetUrl = `https://images-api.nasa.gov/asset/${firstData.nasa_id}`;
-        const assetRes = await fetch(assetUrl, { signal: assetController.signal });
+        console.log('[NASA] Fetching asset for:', firstData.nasa_id, 'Asset URL:', assetUrl);
+        
+        const assetRes = await fetch(assetUrl, { 
+          signal: assetController.signal,
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'NASA-Mobile-App/1.0',
+            'Cache-Control': 'no-cache'
+          }
+        });
         clearTimeout(assetTimeoutId);
         
-        if (!assetRes.ok) return null;
+        if (!assetRes.ok) {
+          console.warn('[NASA] Asset fetch failed:', assetRes.status, firstData.nasa_id);
+          continue;
+        }
 
         const assetData = await assetRes.json();
         const files = assetData?.collection?.items || [];
 
-        const mp4Files = files.filter(f =>
-          f.href && f.href.toLowerCase().includes('.mp4')
-        );
+        const mp4Files = files.filter(f => {
+          if (!f.href || typeof f.href !== 'string') return false;
+          const href = f.href.toLowerCase();
+          return href.includes('.mp4') && 
+                 !href.includes('.srt') && 
+                 !href.includes('.vtt') &&
+                 (href.startsWith('https://') || href.startsWith('http://'));
+        });
 
-        if (mp4Files.length === 0) return null;
+        if (mp4Files.length === 0) {
+          console.warn('[NASA] No valid MP4 files found for:', firstData.nasa_id);
+          continue;
+        }
 
         let selectedVideo = null;
-        
         const qualityPreferences = [
-          ['small', 'preview', 'thumb'],
-          ['240', '360', '480'],
-          ['medium'],
-          ['orig'],
-          [''] 
+          ['small', 'preview', '240p', '360p'],
+          ['medium', '480p'],
+          ['720p'],
+          ['orig', 'original', 'large']
         ];
         
         for (const qualityGroup of qualityPreferences) {
@@ -119,32 +156,51 @@ export async function fetchNasaShortVideos(page = 1) {
           selectedVideo = mp4Files[0];
         }
 
+        const secureUrl = selectedVideo.href.replace("http://", "https://");
+        console.log('[NASA] Selected video:', {
+          id: firstData.nasa_id,
+          url: secureUrl,
+          title: firstData.title?.substring(0, 60)
+        });
+
         const videoData = {
           id: firstData.nasa_id,
           title: firstData.title?.substring(0, 60) || "NASA Video",
           description: firstData.description?.substring(0, 100) || "",
-          video_url: selectedVideo.href,
+          video_url: secureUrl,
           date_created: firstData.date_created || "",
           center: firstData.center || "NASA",
           keywords: firstData.keywords?.slice(0, 3) || [],
         };
         
-        return videoData;
-      } catch  {
-        return null;
-      }
-    });
+        console.log('[NASA] Video data:', videoData);
 
-    const results = await Promise.all(assetPromises);
-    const validVideos = results.filter(Boolean);
-    
-    const videosToReturn = validVideos.slice(0, Math.min(Math.max(validVideos.length, 5), 10));
+        validVideos.push(videoData);
+        
+        if (validVideos.length >= 6) break; 
+        
+        await new Promise(resolve => setTimeout(resolve, 50));
+      } catch (error) {
+        console.warn('[NASA] Error processing video asset:', error.message);
+        continue;
+      }
+    }
+
+    console.log('[NASA] Valid videos found:', validVideos.length);
 
     return {
-      videos: videosToReturn,
-      hasMore: videosToReturn.length >= 5 && page < 10
+      videos: validVideos,
+      hasMore: validVideos.length >= 3 && page < 8
     };
-  } catch  {
+  } catch (error) {
+    console.error('[NASA] API Error:', error.message, { page, retryCount });
+    
+    if (retryCount < MAX_RETRIES && error.name !== 'AbortError') {
+      console.log('[NASA] Retrying API call...', retryCount + 1);
+      await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1))); 
+      return fetchNasaShortVideos(page, retryCount + 1);
+    }
+    
     return { videos: [], hasMore: false };
   }
 }
@@ -157,6 +213,7 @@ const VIDEO_HEIGHT = screenHeight - HEADER_HEIGHT - TAB_HEIGHT;
 const LoadingSkeleton = () => (
   <View style={{ height: VIDEO_HEIGHT, width: screenWidth }} className="bg-black justify-center items-center">
     <ActivityIndicator size="large" color="#3B82F6" />
+    <Text className="text-white text-sm mt-4">Loading NASA Videos...</Text>
   </View>
 );
 
@@ -170,29 +227,47 @@ const VideoPlayer = ({ videoUrl, isActive, index, shouldPlay }) => {
   const player = useVideoPlayer(videoUrl, (player) => {
     if (!isMountedRef.current) return;
     
-    playerRef.current = player;
-    player.loop = true;
-    player.muted = false;
-    player.volume = 0.8;
+    try {
+      console.log('Video player initialized:', { index, videoUrl: videoUrl.substring(0, 50) + '...' });
+      
+      playerRef.current = player;
+      player.loop = true;
+      player.muted = false;
+      player.volume = 0.8;
 
-    player.addListener('playingChange', (playingState) => {
-      if (!isMountedRef.current) return;
-      const playing = typeof playingState === 'object' ? playingState.isPlaying : playingState;
-      isPlayingRef.current = playing;
-    });
+      player.addListener('playingChange', (playingState) => {
+        if (!isMountedRef.current) return;
+        const playing = typeof playingState === 'object' ? playingState.isPlaying : playingState;
+        isPlayingRef.current = playing;
+      });
 
-    player.addListener('statusChange', (status) => {
-      if (!isMountedRef.current) return;
-      if (status.error) {
-        setHasError(true);
-      }
-    });
-    
-    setTimeout(() => {
-      if (isMountedRef.current) {
-        setIsPlayerReady(true);
-      }
-    }, 100);
+      player.addListener('statusChange', (status) => {
+        if (!isMountedRef.current) return;
+        
+        console.log('Video status change:', { index, status: status.status, error: !!status.error });
+        
+        if (status.error || status.status === 'error') {
+          console.error('Video player error:', status.error);
+          setHasError(true);
+          return;
+        }
+        
+        if (status.status === 'readyToPlay' || status.isLoaded) {
+          console.log('Video ready to play:', index);
+          setIsPlayerReady(true);
+        }
+      });
+
+      setTimeout(() => {
+        if (isMountedRef.current && !hasError) {
+          setIsPlayerReady(true);
+        }
+      }, 1000);
+      
+    } catch (error) {
+      console.error('Video player setup error:', error);
+      setHasError(true);
+    }
   });
 
   useEffect(() => {
@@ -200,14 +275,13 @@ const VideoPlayer = ({ videoUrl, isActive, index, shouldPlay }) => {
       isMountedRef.current = false;
       if (playerRef.current) {
         try {
-          if (playerRef.current.isPlayable) {
-            playerRef.current.pause();
-          }
-        } catch {
+          playerRef.current.pause();
+        } catch (error) {
+          console.warn('Error pausing video:', error);
         }
       }
     };
-  }, [index]);
+  }, []);
 
   useEffect(() => {
     if (!isPlayerReady || hasError || !player || !isMountedRef.current) {
@@ -216,8 +290,11 @@ const VideoPlayer = ({ videoUrl, isActive, index, shouldPlay }) => {
 
     const controlPlayback = async () => {
       try {
+        if (!isMountedRef.current || !player) return;
+
         if (isActive && shouldPlay) {
           if (!isPlayingRef.current) {
+            console.log('Starting video playback:', index);
             await player.play();
           }
         } else {
@@ -226,19 +303,28 @@ const VideoPlayer = ({ videoUrl, isActive, index, shouldPlay }) => {
             player.currentTime = 0;
           }
         }
-      } catch  {
+      } catch (error) {
+        console.error('Video playback control error:', error);
       }
     };
 
-    const timer = setTimeout(controlPlayback, 50);
+    const timer = setTimeout(controlPlayback, 100);
     return () => clearTimeout(timer);
-  }, [isActive, shouldPlay, isPlayerReady, hasError, player, index]);
+  }, [isActive, shouldPlay, isPlayerReady, hasError, player]);
 
   if (hasError) {
     return (
       <View className="flex-1 justify-center items-center bg-gray-900">
         <Ionicons name="warning-outline" size={32} color="#EF4444" />
-        <Text className="text-white text-sm mt-2">Video Error</Text>
+        <Text className="text-white text-sm mt-2">Video Unavailable</Text>
+      </View>
+    );
+  }
+
+  if (!isPlayerReady) {
+    return (
+      <View className="flex-1 justify-center items-center bg-gray-900">
+        <ActivityIndicator size="small" color="#3B82F6" />
       </View>
     );
   }
@@ -271,6 +357,7 @@ const NasaShorts = () => {
   const flatListRef = useRef(null);
   const appState = useRef(AppState.currentState);
   const scrollTimeout = useRef(null);
+  const favoritesSyncRef = useRef(false);
 
   useEffect(() => {
     loadFavorites();
@@ -283,22 +370,33 @@ const NasaShorts = () => {
         const favoritesArray = JSON.parse(storedFavorites);
         setFavorites(new Set(favoritesArray));
       }
-    } catch  {
+      favoritesSyncRef.current = true;
+    } catch (error) {
+      console.warn('Error loading favorites:', error);
     }
   };
 
   const saveFavorites = async (favoritesSet) => {
+    if (!favoritesSyncRef.current) return;
+    
     try {
-      await AsyncStorage.setItem('nasa_favorites', JSON.stringify(Array.from(favoritesSet)));
-    } catch {
+      const favoritesArray = Array.from(favoritesSet);
+      await AsyncStorage.setItem('nasa_favorites', JSON.stringify(favoritesArray));
+    } catch (error) {
+      console.warn('Error saving favorites:', error);
     }
   };
 
   useEffect(() => {
-    saveFavorites(favorites);
+    if (favoritesSyncRef.current) {
+      saveFavorites(favorites);
+    }
   }, [favorites]);
+
   useEffect(() => {
     const handleAppStateChange = (nextAppState) => {
+      console.log('App state change:', nextAppState);
+      
       if (appState.current.match(/active/) && nextAppState === 'background') {
         setIsPlaying(false);
       } else if (appState.current.match(/background/) && nextAppState === 'active') {
@@ -316,17 +414,25 @@ const NasaShorts = () => {
 
   const loadVideos = useCallback(async (pageNum = 1, reset = false) => {
     try {
+      console.log('Loading videos:', { pageNum, reset });
+      
       if (pageNum === 1 && !reset) setLoading(true);
       else if (pageNum > 1) setLoadingMore(true);
 
       const { videos: newVideos, hasMore: moreAvailable } = await fetchNasaShortVideos(pageNum);
+      
+      console.log('Videos loaded:', { count: newVideos.length, hasMore: moreAvailable });
+      
+      if (newVideos.length === 0 && pageNum === 1) {
+        throw new Error('No videos found. Please check your internet connection.');
+      }
       
       if (reset) {
         setVideos(newVideos);
         setCurrentIndex(0);
         setTimeout(() => {
           setIsPlaying(true);
-        }, 200);
+        }, 500);
       } else {
         setVideos(prev => [...prev, ...newVideos]);
       }
@@ -334,6 +440,7 @@ const NasaShorts = () => {
       setHasMore(moreAvailable);
       setError(null);
     } catch (e) {
+      console.error('Error loading videos:', e);
       setError(e.message);
       if (pageNum === 1) setVideos([]);
     } finally {
@@ -344,12 +451,14 @@ const NasaShorts = () => {
   }, []);
 
   const onRefresh = useCallback(() => {
+    console.log('Refreshing videos');
     setRefreshing(true);
     setPage(1);
     loadVideos(1, true);
   }, [loadVideos]);
 
   useEffect(() => {
+    console.log('Initial video load');
     loadVideos(1, true);
   }, [loadVideos]);
 
@@ -358,29 +467,25 @@ const NasaShorts = () => {
   }, []);
 
   const toggleFavorite = useCallback(async (videoId) => {
-    try {
-      const storedFavorites = await AsyncStorage.getItem('nasa_favorites');
-      const currentFavorites = storedFavorites ? JSON.parse(storedFavorites) : [];
-      
-      let newFavorites;
-      if (currentFavorites.includes(videoId)) {
-        newFavorites = currentFavorites.filter(id => id !== videoId);
+    if (!favoritesSyncRef.current) return;
+    
+    setFavorites(prev => {
+      const newFavorites = new Set(prev);
+      if (newFavorites.has(videoId)) {
+        newFavorites.delete(videoId);
       } else {
-        newFavorites = [...currentFavorites, videoId];
+        newFavorites.add(videoId);
       }
-      
-      await AsyncStorage.setItem('nasa_favorites', JSON.stringify(newFavorites));
-      setFavorites(new Set(newFavorites));
-    } catch  {
-    }
+      return newFavorites;
+    });
   }, []);
 
   const handleShare = useCallback(async (video) => {
     try {
       const shareContent = {
         message: Platform.OS === 'ios' 
-          ? `Check out this amazing NASA video: "${video.title}" 🚀\n\n${video.description}\n\nFrom: ${video.center}` 
-          : `Check out this amazing NASA video: "${video.title}" 🚀\n\n${video.description}\n\nFrom: ${video.center}\n\nVideo: ${video.video_url}`,
+          ? `Check out this amazing NASA video: "${video.title}"\n\n${video.description}\n\nFrom: ${video.center}` 
+          : `Check out this amazing NASA video: "${video.title}"\n\n${video.description}\n\nFrom: ${video.center}\n\nVideo: ${video.video_url}`,
         url: Platform.OS === 'ios' ? video.video_url : undefined,
         title: `NASA: ${video.title}`
       };
@@ -389,7 +494,8 @@ const NasaShorts = () => {
         dialogTitle: 'Share NASA Video',
         subject: `NASA: ${video.title}`
       });
-    } catch  {
+    } catch (error) {
+      console.warn('Share error:', error);
     }
   }, []);
 
@@ -404,12 +510,11 @@ const NasaShorts = () => {
     scrollTimeout.current = setTimeout(() => {
       if (newIndex !== currentIndex && newIndex >= 0 && newIndex < videos.length) {
         setCurrentIndex(newIndex);
-        
         setTimeout(() => {
           setIsPlaying(true);
-        }, 100);
+        }, 200);
       }
-    }, 200); 
+    }, 150);
   }, [currentIndex, videos.length]);
 
   const onViewableItemsChanged = useCallback(({ viewableItems }) => {
@@ -422,22 +527,24 @@ const NasaShorts = () => {
       
       if (newIndex !== null && newIndex !== undefined && 
           newIndex !== currentIndex && newIndex >= 0 && newIndex < videos.length &&
-          mostVisible.percentVisible > 70) { 
+          mostVisible.percentVisible > 70) {
         
         setCurrentIndex(newIndex);
-        
         setTimeout(() => {
           setIsPlaying(true);
-        }, 150);
+        }, 200);
       }
     }
   }, [currentIndex, videos.length]);
 
   const loadMoreVideos = useCallback(() => {
     if (!loadingMore && hasMore && videos.length > 0) {
+      console.log('Loading more videos, page:', page + 1);
       const nextPage = page + 1;
       setPage(nextPage);
       loadVideos(nextPage, false);
+    } else {
+      console.log('Cannot load more:', { loadingMore, hasMore, videosLength: videos.length });
     }
   }, [loadingMore, hasMore, page, loadVideos, videos.length]);
 
@@ -580,7 +687,7 @@ const NasaShorts = () => {
         onViewableItemsChanged={onViewableItemsChanged}
         viewabilityConfig={{
           itemVisiblePercentThreshold: 75,
-          minimumViewTime: 250, 
+          minimumViewTime: 300,
           waitForInteraction: false
         }}
         onScroll={handleScroll}
@@ -595,18 +702,17 @@ const NasaShorts = () => {
             colors={["#3B82F6"]}
           />
         }
-        ListFooterComponent={
-          loadingMore ? (
-            <View className="py-4 justify-center items-center">
-              <ActivityIndicator size="small" color="#3B82F6" />
-              <Text className="text-gray-400 text-sm mt-2">Loading more videos...</Text>
-            </View>
-          ) : null
-        }
         decelerationRate="fast"
         snapToInterval={VIDEO_HEIGHT}
         snapToAlignment="start"
         bounces={false}
+        ListFooterComponent={
+          loadingMore ? (
+            <View className="py-4">
+              <ActivityIndicator size="small" color="#3B82F6" />
+            </View>
+          ) : null
+        }
       />
     </View>
   );

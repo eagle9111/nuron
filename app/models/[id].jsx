@@ -8,7 +8,6 @@ import * as THREE from 'three';
 import { nasaModels } from '../../nasamodels';
 import { useThemeStore } from '../../zustand/useThemeStore';
 
-// Refresh icon component
 function RefreshIcon({ size = 20, color = '#FFF' }) {
   return (
     <View style={{ width: size, height: size, justifyContent: 'center', alignItems: 'center' }}>
@@ -26,7 +25,7 @@ function CubeLoader() {
   );
 }
 
-function Model({ url, refreshKey, onRefresh }) {
+function Model({ url, onError, refreshKey, onRefresh }) {
   const { scene, error: gltfError } = useGLTF(url);
   const ref = useRef();
   const [hasError, setHasError] = useState(false);
@@ -42,6 +41,7 @@ function Model({ url, refreshKey, onRefresh }) {
     }
   }, [onRefresh]);
 
+  // Handle GLTF loading errors
   useEffect(() => {
     if (gltfError) {
       console.warn('GLTF loading error:', gltfError);
@@ -49,6 +49,7 @@ function Model({ url, refreshKey, onRefresh }) {
     }
   }, [gltfError, triggerRefresh]);
 
+  // Process scene with comprehensive try-catch
   useEffect(() => {
     if (!scene || isProcessed || hasError) return;
 
@@ -58,16 +59,21 @@ function Model({ url, refreshKey, onRefresh }) {
 
     processingTimeoutRef.current = setTimeout(() => {
       try {
+        // Simple approach: just add the scene and let Three.js handle it
         if (ref.current) {
+          // Clear previous content
           while (ref.current.children.length > 0) {
             ref.current.remove(ref.current.children[0]);
           }
 
+          // Try to process the scene, but if anything fails, just use it as-is
           let sceneToAdd = scene;
           
           try {
+            // Attempt basic processing
             sceneToAdd = scene.clone();
             
+            // Simple centering attempt
             const box = new THREE.Box3().setFromObject(sceneToAdd);
             if (box && box.min && box.max && 
                 typeof box.min.x === 'number' && typeof box.max.x === 'number') {
@@ -90,7 +96,7 @@ function Model({ url, refreshKey, onRefresh }) {
             }
           } catch (processingError) {
             console.warn('Scene processing failed, using original:', processingError);
-            sceneToAdd = scene; 
+            sceneToAdd = scene; // Fallback to original scene
           }
 
           ref.current.add(sceneToAdd);
@@ -103,11 +109,13 @@ function Model({ url, refreshKey, onRefresh }) {
     }, 200);
   }, [scene, refreshKey, isProcessed, hasError, triggerRefresh]);
 
+  // Reset state on refresh
   useEffect(() => {
     setIsProcessed(false);
     setHasError(false);
   }, [refreshKey]);
 
+  // Cleanup
   useEffect(() => {
     return () => {
       if (processingTimeoutRef.current) {
@@ -127,18 +135,19 @@ function Model({ url, refreshKey, onRefresh }) {
   return <group ref={ref} />;
 }
 
+// Simple camera controller with auto-refresh on errors
 const CameraController = forwardRef(({ refreshKey, onRefresh }, ref) => {
   const { camera } = useThree();
   const orbitControlsRef = useRef();
   const errorCount = useRef(0);
-  const maxErrors = 3; 
+  const maxErrors = 5; // Auto-refresh after 5 errors
 
   const triggerRefresh = useCallback(() => {
     errorCount.current++;
     console.warn(`Camera error ${errorCount.current}/${maxErrors}, triggering refresh...`);
     
     if (errorCount.current >= maxErrors && onRefresh) {
-      errorCount.current = 0;
+      errorCount.current = 0; // Reset counter
       setTimeout(onRefresh, 100);
     }
   }, [onRefresh]);
@@ -161,6 +170,7 @@ const CameraController = forwardRef(({ refreshKey, onRefresh }, ref) => {
     }
   }, [camera, triggerRefresh]);
 
+  // Monitor for errors and auto-refresh
   useEffect(() => {
     let animationId;
     let frameCount = 0;
@@ -169,7 +179,9 @@ const CameraController = forwardRef(({ refreshKey, onRefresh }, ref) => {
       try {
         frameCount++;
         
+        // Light monitoring every 60 frames
         if (frameCount % 60 === 0 && camera) {
+          // Just check if camera position exists and has basic properties
           if (!camera.position || 
               typeof camera.position.x !== 'number' || 
               !isFinite(camera.position.x)) {
@@ -192,6 +204,7 @@ const CameraController = forwardRef(({ refreshKey, onRefresh }, ref) => {
     };
   }, [camera, triggerRefresh, refreshKey]);
 
+  // Reset error count on refresh
   useEffect(() => {
     errorCount.current = 0;
   }, [refreshKey]);
@@ -226,16 +239,21 @@ const CameraController = forwardRef(({ refreshKey, onRefresh }, ref) => {
 CameraController.displayName = "CameraController";
 
 function Lighting() {
-  return (
-    <group>
-      <ambientLight intensity={0.6} />
-      <directionalLight position={[10, 10, 5]} intensity={1} />
-      <pointLight position={[0, 10, 0]} intensity={0.3} />
-    </group>
-  );
+  try {
+    return (
+      <group>
+        <ambientLight intensity={0.6} />
+        <directionalLight position={[10, 10, 5]} intensity={1} />
+        <pointLight position={[0, 10, 0]} intensity={0.3} />
+      </group>
+    );
+  } catch (error) {
+    console.warn('Lighting error:', error);
+    return null;
+  }
 }
 
-function ErrorOverlay({ onRetry, onGoBack, message }) {
+function ErrorOverlay({ onRetry, onGoBack, colors, message }) {
   return (
     <View className="absolute inset-0 bg-black/90 justify-center items-center p-8 z-50">
       <Text className="text-white text-xl font-bold mb-4">Model failed to load</Text>
@@ -271,7 +289,7 @@ const ModelViewer = () => {
   const cameraControllerRef = useRef();
   const autoRefreshTimeoutRef = useRef(null);
   const refreshCount = useRef(0);
-  const maxRefreshes = 1000; 
+  const maxRefreshes = 100; // Prevent infinite refresh loops
 
   const modelData = useMemo(() => {
     try {
